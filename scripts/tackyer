@@ -1,0 +1,109 @@
+#!/usr/bin/env node
+
+const { resolve } = require('path')
+const request = require('superagent')
+const globby = require('globby')
+const css = require('css')
+const fs = require('fs')
+
+const flattenArray = (arr) => [].concat(...arr)
+
+const rulesToString = (rules) => {
+  return rules.map(rule => {
+    return `${rule.selectors[0]}{${rule.declarations.map(dec => `${dec.property}:${dec.value};`).join('')}}`
+  }).join('')
+}
+
+// Load the CSS
+request('https://unpkg.com/tachyons@4.10.0/css/tachyons.css')
+  .end(async (err, resp) => {
+    const parse = css.parse(resp.text)
+
+    const rules = parse.stylesheet.rules
+    const mediaRules = rules.filter(r => r.type === 'media')
+
+    // Get all the JS files
+    const files = await globby([ `${resolve(process.argv[2])}/*.html` ], { expandDirectories: true })
+
+    // Get all of the classes that are used in the files
+    let classes = files.map((file) => {
+      const fileContents = fs.readFileSync(file).toString()
+
+      const classRegex = /class\=\".*\"/g
+
+      return fileContents.match(classRegex)
+    }).filter(Boolean)
+
+    // Split strings into individual classes ("w-50 f5 white" => [ "w-50", "f5" , "white" ])
+    classes = flattenArray(classes).map(statement => {
+      return statement.replace('class=\"', '').replace(/\".*/g, '').split(' ')
+    })
+
+    // Only keep one instance of a class
+    classes = Array.from(new Set(flattenArray(classes)))
+
+    let missingClasses = []
+    let cssRules = classes.map((className) => {
+      let matchingRule = rules.filter(rule => {
+        if (rule.selectors && rule.selectors.indexOf(`.${className}`) > -1) {
+          return rule
+        }
+      })[0]
+
+      if (matchingRule) {
+        return matchingRule
+      } else {
+        // Try to find the class in a media rule
+        matchingRule = mediaRules.map((mediaRule) => {
+          const mediaMatch = mediaRule.rules.filter((rule) => {
+            if (rule.selectors && rule.selectors.indexOf(`.${className}`) > -1) {
+              return rule
+            }
+          })[0]
+
+          if (mediaMatch) {
+            return { [mediaRule.media]: mediaMatch }
+          } else {
+            return null
+          }
+        }).filter(Boolean)[0]
+      }
+
+      if (!matchingRule) {
+        missingClasses.push(className)
+      }
+
+      return matchingRule
+    }).filter(Boolean)
+
+
+    const mediaCssRules = {}
+    let noMediaCssRules = cssRules.map((rule) => {
+      // If it only has 1 key, we know it is a media rule
+      if(Object.keys(rule).length === 1) {
+        const media = Object.keys(rule)[0]
+
+        if (!(media in mediaCssRules)) {
+          mediaCssRules[media] = new Set()
+        }
+
+        mediaCssRules[media].add(Object.values(rule)[0])
+
+        return null
+      } else {
+        return rule
+      }
+    }).filter(Boolean)
+
+    const noMediaMin = rulesToString(noMediaCssRules)
+
+    const mediaMin = Object.keys(mediaCssRules).map((mediaGroup) => {
+      const rules = Array.from(mediaCssRules[mediaGroup])
+
+      return `${mediaGroup}{${rulesToString(rules)}}`
+    })
+
+    const minCss = noMediaMin + mediaMin
+
+    process.stdout.write(minCss)
+  })
